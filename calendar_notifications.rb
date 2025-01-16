@@ -11,6 +11,7 @@ class CalendarNotificationUpdater
   CREDENTIALS_PATH = 'credentials.json'.freeze
   TOKEN_PATH = 'token.yaml'.freeze
   SCOPE = Google::Apis::CalendarV3::AUTH_CALENDAR
+  DESIRED_REMINDERS = [2, 5].freeze  # minutes
 
   def initialize(dry_run: false)
     @dry_run = dry_run
@@ -37,6 +38,19 @@ class CalendarNotificationUpdater
     credentials
   end
 
+  def should_skip_event?(event)
+    return true if event.start.date  # Skip all-day events
+    return true if event.summary&.include?('OOO')  # Skip OOO events
+
+    # Get current reminder times
+    current_reminders = event.reminders&.overrides&.map { |r| r.minutes }&.sort || []
+
+    # Skip if all desired reminders are already set
+    return true if DESIRED_REMINDERS.all? { |time| current_reminders.include?(time) }
+
+    false
+  end
+
   def update_notifications
     calendar_id = 'primary'
     start_date = DateTime.now
@@ -52,33 +66,36 @@ class CalendarNotificationUpdater
     )
 
     changes_count = 0
-    skipped_count = 0
+    skipped = {
+      all_day: 0,
+      ooo: 0,
+      has_reminders: 0
+    }
 
     puts "#{@dry_run ? '[DRY RUN] ' : ''}Processing events..."
     response.items.each do |event|
-      if event.start.date
-        puts "#{@dry_run ? '[DRY RUN] ' : ''}Skipping all-day event: #{event.summary}"
-        skipped_count += 1
-        next
-      end
+      if should_skip_event?(event)
+        reason = if event.start.date
+                  skipped[:all_day] += 1
+                  "all-day event"
+                elsif event.summary&.include?('OOO')
+                  skipped[:ooo] += 1
+                  "OOO event"
+                else
+                  skipped[:has_reminders] += 1
+                  "already has required notifications"
+                end
 
-      # Check current reminders
-      current_reminders = event.reminders&.overrides&.map { |r| r.minutes } || []
-      needed_reminders = [2, 5] - current_reminders
-
-      if needed_reminders.empty?
-        puts "#{@dry_run ? '[DRY RUN] ' : ''}Event already has required notifications: #{event.summary}"
-        skipped_count += 1
+        puts "#{@dry_run ? '[DRY RUN] ' : ''}Skipping #{event.summary} (#{reason})"
         next
       end
 
       # Create new reminders object with desired notification times
       new_reminders = Google::Apis::CalendarV3::Event::Reminders.new(
         use_default: false,
-        overrides: [
-          Google::Apis::CalendarV3::EventReminder.new(minutes: 2, method: 'popup'),
-          Google::Apis::CalendarV3::EventReminder.new(minutes: 5, method: 'popup')
-        ]
+        overrides: DESIRED_REMINDERS.map do |minutes|
+          Google::Apis::CalendarV3::EventReminder.new(minutes: minutes, method: 'popup')
+        end
       )
 
       # Update event with new reminders
@@ -87,11 +104,11 @@ class CalendarNotificationUpdater
       begin
         if @dry_run
           puts "[DRY RUN] Would update notifications for event: #{event.summary} on #{event.start.date_time}"
-          puts "          Adding notifications: #{needed_reminders.join(', ')} minutes"
+          puts "          Adding notifications: #{DESIRED_REMINDERS.join(', ')} minutes"
         else
           @service.update_event(calendar_id, event.id, event)
           puts "Updated notifications for event: #{event.summary} on #{event.start.date_time}"
-          puts "Added notifications: #{needed_reminders.join(', ')} minutes"
+          puts "Added notifications: #{DESIRED_REMINDERS.join(', ')} minutes"
         end
         changes_count += 1
       rescue => e
@@ -99,10 +116,15 @@ class CalendarNotificationUpdater
       end
     end
 
+    total_skipped = skipped.values.sum
+
     puts "\n#{@dry_run ? '[DRY RUN] ' : ''}Summary:"
     puts "Events that would be updated: #{changes_count}"
-    puts "Events skipped (all-day or already configured): #{skipped_count}"
-    puts "Total events processed: #{changes_count + skipped_count}"
+    puts "Events skipped:"
+    puts "  - All-day events: #{skipped[:all_day]}"
+    puts "  - OOO events: #{skipped[:ooo]}"
+    puts "  - Already configured: #{skipped[:has_reminders]}"
+    puts "Total events processed: #{changes_count + total_skipped}"
     puts "\nNotification update complete!"
   end
 end
