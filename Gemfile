@@ -1,6 +1,6 @@
 source 'https://rubygems.org'
 
-ruby '~> 2.7'  # Specify minimum Ruby version
+ruby '>= 2.7', '< 4.0'  # Support Ruby 2.7+ and Ruby 3.x
 
 gem 'google-apis-calendar_v3', '~> 0.25.0'  # Specific Calendar API gem
 gem 'googleauth', '~> 1.8'                  # For authentication
