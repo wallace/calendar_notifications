@@ -3,6 +3,7 @@ require 'googleauth'
 require 'googleauth/stores/file_token_store'
 require 'date'
 require 'fileutils'
+require 'optparse'
 
 class CalendarNotificationUpdater
   OOB_URI = 'urn:ietf:wg:oauth:2.0:oob'.freeze
@@ -11,7 +12,8 @@ class CalendarNotificationUpdater
   TOKEN_PATH = 'token.yaml'.freeze
   SCOPE = Google::Apis::CalendarV3::AUTH_CALENDAR
 
-  def initialize
+  def initialize(dry_run: false)
+    @dry_run = dry_run
     @service = Google::Apis::CalendarV3::CalendarService.new
     @service.client_options.application_name = APPLICATION_NAME
     @service.authorization = authorize
@@ -40,7 +42,7 @@ class CalendarNotificationUpdater
     start_date = DateTime.now
     end_date = DateTime.now >> 12  # 12 months from now
 
-    puts "Fetching events..."
+    puts "#{@dry_run ? '[DRY RUN] ' : ''}Fetching events..."
     response = @service.list_events(
       calendar_id,
       single_events: true,
@@ -49,9 +51,26 @@ class CalendarNotificationUpdater
       order_by: 'startTime'
     )
 
-    puts "Processing events..."
+    changes_count = 0
+    skipped_count = 0
+
+    puts "#{@dry_run ? '[DRY RUN] ' : ''}Processing events..."
     response.items.each do |event|
-      next if event.start.date  # Skip all-day events
+      if event.start.date
+        puts "#{@dry_run ? '[DRY RUN] ' : ''}Skipping all-day event: #{event.summary}"
+        skipped_count += 1
+        next
+      end
+
+      # Check current reminders
+      current_reminders = event.reminders&.overrides&.map { |r| r.minutes } || []
+      needed_reminders = [2, 5] - current_reminders
+
+      if needed_reminders.empty?
+        puts "#{@dry_run ? '[DRY RUN] ' : ''}Event already has required notifications: #{event.summary}"
+        skipped_count += 1
+        next
+      end
 
       # Create new reminders object with desired notification times
       new_reminders = Google::Apis::CalendarV3::Event::Reminders.new(
@@ -66,21 +85,46 @@ class CalendarNotificationUpdater
       event.reminders = new_reminders
 
       begin
-        @service.update_event(calendar_id, event.id, event)
-        puts "Updated notifications for event: #{event.summary} on #{event.start.date_time}"
+        if @dry_run
+          puts "[DRY RUN] Would update notifications for event: #{event.summary} on #{event.start.date_time}"
+          puts "          Adding notifications: #{needed_reminders.join(', ')} minutes"
+        else
+          @service.update_event(calendar_id, event.id, event)
+          puts "Updated notifications for event: #{event.summary} on #{event.start.date_time}"
+          puts "Added notifications: #{needed_reminders.join(', ')} minutes"
+        end
+        changes_count += 1
       rescue => e
-        puts "Error updating event #{event.summary}: #{e.message}"
+        puts "#{@dry_run ? '[DRY RUN] ' : ''}Error processing event #{event.summary}: #{e.message}"
       end
     end
 
-    puts "Notification update complete!"
+    puts "\n#{@dry_run ? '[DRY RUN] ' : ''}Summary:"
+    puts "Events that would be updated: #{changes_count}"
+    puts "Events skipped (all-day or already configured): #{skipped_count}"
+    puts "Total events processed: #{changes_count + skipped_count}"
+    puts "\nNotification update complete!"
   end
 end
 
-# Usage
+# Parse command line options
 if __FILE__ == $0
+  options = {}
+  OptionParser.new do |opts|
+    opts.banner = "Usage: calendar_notifications.rb [options]"
+
+    opts.on("-d", "--dry-run", "Show what would be done without making changes") do |d|
+      options[:dry_run] = d
+    end
+
+    opts.on("-h", "--help", "Show this help message") do
+      puts opts
+      exit
+    end
+  end.parse!
+
   puts "Starting Calendar Notification Updater..."
-  updater = CalendarNotificationUpdater.new
+  puts "[DRY RUN MODE ENABLED] No changes will be made" if options[:dry_run]
+  updater = CalendarNotificationUpdater.new(dry_run: options[:dry_run])
   updater.update_notifications
 end
-
