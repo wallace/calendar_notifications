@@ -4,6 +4,7 @@ require 'googleauth/stores/file_token_store'
 require 'date'
 require 'fileutils'
 require 'optparse'
+require 'set'
 
 class CalendarNotificationUpdater
   OOB_URI = 'urn:ietf:wg:oauth:2.0:oob'.freeze
@@ -40,7 +41,8 @@ class CalendarNotificationUpdater
   end
 
   def should_skip_event?(event)
-    return true if event.start.date  # Skip all-day events
+    return true if event.nil? || event.start.nil?  # Skip invalid events
+    return true if event.start.date   # Skip all-day events
     return true if event.summary&.include?('OOO')  # Skip OOO events
 
     # Get current reminder times
@@ -93,22 +95,67 @@ class CalendarNotificationUpdater
     end
   end
 
+  def print_summary(changes_count, skipped)
+    puts "\n#{@dry_run ? '[DRY RUN] ' : ''}Summary:"
+    puts "Events that would be updated: #{changes_count}"
+    puts "\nEvents skipped:"
+    puts "  - Invalid events: #{skipped[:invalid].length}"
+    puts "  - All-day events: #{skipped[:all_day]}"
+    puts "  - OOO events: #{skipped[:ooo]}"
+    puts "  - Already configured: #{skipped[:has_reminders]}"
+    if @recurring_strategy == :master
+      puts "  - Recurring instances (master updated): #{skipped[:recurring_instance]}"
+    end
+
+    if skipped[:invalid].any?
+      puts "\nDetailed list of invalid events:"
+      skipped[:invalid].each do |event|
+        puts "\nEvent: #{event[:summary]}"
+        puts "ID: #{event[:id]}"
+        puts "Issue: #{event[:reason]}"
+        puts "Raw start time data: #{event[:raw_start]}"
+      end
+    end
+
+    # Calculate total events - being explicit about the components
+    total = changes_count
+    total += skipped[:invalid].length
+    total += skipped[:all_day]
+    total += skipped[:ooo]
+    total += skipped[:has_reminders]
+    total += skipped[:recurring_instance]
+
+    puts "\nTotal events processed: #{total}"
+    puts "Recurring events strategy: #{@recurring_strategy}"
+    puts "\nNotification update complete!"
+  end
+
   def update_notifications
     calendar_id = 'primary'
     start_date = DateTime.now
     end_date = DateTime.now >> 12  # 12 months from now
 
     puts "#{@dry_run ? '[DRY RUN] ' : ''}Fetching events..."
-    response = @service.list_events(
-      calendar_id,
-      single_events: @recurring_strategy == :individual,  # Expand recurring events if handling individually
-      time_min: start_date.rfc3339,
-      time_max: end_date.rfc3339,
-      order_by: 'startTime'
-    )
+    begin
+      response = @service.list_events(
+        calendar_id,
+        single_events: @recurring_strategy == :individual,  # Expand recurring events if handling individually
+        time_min: start_date.rfc3339,
+        time_max: end_date.rfc3339
+      )
+    rescue Google::Apis::ClientError => e
+      puts "Error fetching events: #{e.message}"
+      puts "Please ensure your Google Calendar API credentials are properly set up."
+      exit 1
+    rescue => e
+      puts "Unexpected error fetching events: #{e.message}"
+      puts e.backtrace
+      exit 1
+    end
 
     changes_count = 0
     skipped = {
+      invalid: [],  # Array to store details about invalid events
       all_day: 0,
       ooo: 0,
       has_reminders: 0,
@@ -120,7 +167,16 @@ class CalendarNotificationUpdater
     puts "#{@dry_run ? '[DRY RUN] ' : ''}Processing events..."
     response.items.each do |event|
       if should_skip_event?(event)
-        reason = if event.start.date
+        reason = if event.nil? || event.start.nil?
+                  details = {
+                    summary: event&.summary || 'Unnamed event',
+                    id: event&.id || 'No ID',
+                    reason: event.nil? ? 'Event is nil' : 'Event start time is nil',
+                    raw_start: event&.start.inspect
+                  }
+                  skipped[:invalid] << details
+                  "invalid event data"
+                elsif event.start.date
                   skipped[:all_day] += 1
                   "all-day event"
                 elsif event.summary&.include?('OOO')
@@ -131,7 +187,7 @@ class CalendarNotificationUpdater
                   "already has required notifications"
                 end
 
-        puts "#{@dry_run ? '[DRY RUN] ' : ''}Skipping #{event.summary} (#{reason})"
+        puts "#{@dry_run ? '[DRY RUN] ' : ''}Skipping #{event&.summary || 'Unnamed event'} (#{reason})"
         next
       end
 
@@ -149,18 +205,7 @@ class CalendarNotificationUpdater
       changes_count += 1 if handle_recurring_event(calendar_id, event)
     end
 
-    total_skipped = skipped.values.sum
-
-    puts "\n#{@dry_run ? '[DRY RUN] ' : ''}Summary:"
-    puts "Events that would be updated: #{changes_count}"
-    puts "Events skipped:"
-    puts "  - All-day events: #{skipped[:all_day]}"
-    puts "  - OOO events: #{skipped[:ooo]}"
-    puts "  - Already configured: #{skipped[:has_reminders]}"
-    puts "  - Recurring instances (master updated): #{skipped[:recurring_instance]}" if @recurring_strategy == :master
-    puts "Total events processed: #{changes_count + total_skipped}"
-    puts "Recurring events strategy: #{@recurring_strategy}"
-    puts "\nNotification update complete!"
+    print_summary(changes_count, skipped)
   end
 end
 
