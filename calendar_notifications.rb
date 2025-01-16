@@ -40,7 +40,24 @@ class CalendarNotificationUpdater
     credentials
   end
 
-  def should_skip_event?(event)
+  def remove_invalid_event(calendar_id, event)
+    return unless event&.id
+
+    begin
+      if @dry_run
+        puts "[DRY RUN] Would remove invalid event: #{event.summary || 'Unnamed event'} (#{event.id})"
+      else
+        @service.delete_event(calendar_id, event.id)
+        puts "Removed invalid event: #{event.summary || 'Unnamed event'} (#{event.id})"
+      end
+      return true
+    rescue => e
+      puts "Error removing event #{event&.summary || 'Unnamed event'}: #{e.message}"
+      return false
+    end
+  end
+
+  def should_skip_event?(event, remove_invalid: false)
     return true if event.nil? || event.start.nil?  # Skip invalid events
     return true if event.start.date   # Skip all-day events
     return true if event.summary&.include?('OOO')  # Skip OOO events
@@ -100,6 +117,7 @@ class CalendarNotificationUpdater
     puts "Events that would be updated: #{changes_count}"
     puts "\nEvents skipped:"
     puts "  - Invalid events: #{skipped[:invalid].length}"
+    puts "  - Invalid events removed: #{skipped[:removed]}"
     puts "  - All-day events: #{skipped[:all_day]}"
     puts "  - OOO events: #{skipped[:ooo]}"
     puts "  - Already configured: #{skipped[:has_reminders]}"
@@ -120,6 +138,7 @@ class CalendarNotificationUpdater
     # Calculate total events - being explicit about the components
     total = changes_count
     total += skipped[:invalid].length
+    total += skipped[:removed]
     total += skipped[:all_day]
     total += skipped[:ooo]
     total += skipped[:has_reminders]
@@ -130,7 +149,7 @@ class CalendarNotificationUpdater
     puts "\nNotification update complete!"
   end
 
-  def update_notifications
+  def update_notifications(remove_invalid: false)
     calendar_id = 'primary'
     start_date = DateTime.now
     end_date = DateTime.now >> 12  # 12 months from now
@@ -159,14 +178,15 @@ class CalendarNotificationUpdater
       all_day: 0,
       ooo: 0,
       has_reminders: 0,
-      recurring_instance: 0
+      recurring_instance: 0,
+      removed: 0  # Counter for removed invalid events
     }
 
     processed_recurring_masters = Set.new
 
     puts "#{@dry_run ? '[DRY RUN] ' : ''}Processing events..."
     response.items.each do |event|
-      if should_skip_event?(event)
+      if should_skip_event?(event, remove_invalid: remove_invalid)
         reason = if event.nil? || event.start.nil?
                   details = {
                     summary: event&.summary || 'Unnamed event',
@@ -174,8 +194,13 @@ class CalendarNotificationUpdater
                     reason: event.nil? ? 'Event is nil' : 'Event start time is nil',
                     raw_start: event&.start.inspect
                   }
-                  skipped[:invalid] << details
-                  "invalid event data"
+                  if remove_invalid && remove_invalid_event(calendar_id, event)
+                    skipped[:removed] += 1
+                    "invalid event - removed"
+                  else
+                    skipped[:invalid] << details
+                    "invalid event data"
+                  end
                 elsif event.start.date
                   skipped[:all_day] += 1
                   "all-day event"
@@ -227,6 +252,10 @@ if __FILE__ == $0
       options[:recurring_strategy] = strategy
     end
 
+    opts.on("--remove-invalid", "Remove invalid events instead of skipping them") do |r|
+      options[:remove_invalid] = r
+    end
+
     opts.on("-h", "--help", "Show this help message") do
       puts opts
       exit
@@ -235,9 +264,10 @@ if __FILE__ == $0
 
   puts "Starting Calendar Notification Updater..."
   puts "[DRY RUN MODE ENABLED] No changes will be made" if options[:dry_run]
+  puts "[REMOVE INVALID EVENTS ENABLED] Invalid events will be removed" if options[:remove_invalid]
   updater = CalendarNotificationUpdater.new(
     dry_run: options[:dry_run],
     recurring_strategy: options[:recurring_strategy]
   )
-  updater.update_notifications
+  updater.update_notifications(remove_invalid: options[:remove_invalid])
 end
